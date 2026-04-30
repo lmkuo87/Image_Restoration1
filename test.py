@@ -9,22 +9,20 @@ from typing import List
 from PIL import Image
 
 from FaithDiff.create_FaithDiff_model import FaithDiff_pipeline
-from CKPT_PTH import LLAVA_MODEL_PATH, SDXL_PATH, FAITHDIFF_PATH, VAE_FP16_PATH
+from CKPT_PTH import SDXL_PATH, FAITHDIFF_PATH, VAE_FP16_PATH
 from utils.color_fix import wavelet_color_fix, adain_color_fix
 from utils.image_process import check_image_size, create_hdr_effect
-from llava.llm_agent import LLavaAgent
 from utils.system import torch_gc
 
 MAX_SEED = np.iinfo(np.int32).max
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="FaithDiff Local Batch Processing")
+    parser = argparse.ArgumentParser(description="FaithDiff Local Batch Processing (No LLaVA)")
     
     parser.add_argument("--input_dir", type=str, required=True, help="Path to the input images directory")
     parser.add_argument("--output_dir", type=str, required=True, help="Path to the output images directory")
     parser.add_argument("--prompt", type=str, default="", help="Global prompt for all images (Optional)")
 
-    parser.add_argument("--no_llava", action='store_true', default=False, help="Disable LLaVA for auto-captioning")
     parser.add_argument("--cpu_offload", action='store_true', default=False)
     parser.add_argument("--use_fp8", action='store_true', default=False)
     
@@ -55,17 +53,6 @@ def process(
     image = image.resize((w, h), Image.LANCZOS)
     input_image, width_init, height_init, width_now, height_now = check_image_size(image)
     
-    if not args.no_llava and not args.prompt:
-        init_text = user_prompt
-        words = init_text.split()
-        if len(words) > 3:
-            words = words[3:]
-            words[0] = words[0].capitalize()
-        text = ' '.join(words)
-        text = text.split('. ')
-        text = '. '.join(text[:2]) + '.'
-        user_prompt = text 
-
     negative_prompt_init = ""
     generator = torch.Generator(device=Diffusion_device).manual_seed(args.seed)    
     input_image = create_hdr_effect(input_image, args.hdr)
@@ -99,21 +86,10 @@ def process(
 def main():
     args = parse_args()
     
-    if torch.cuda.device_count() >= 2:
-        LLaVA_device = 'cuda:1'
+    if torch.cuda.is_available():
         Diffusion_device = 'cuda:0'
-    elif torch.cuda.device_count() == 1:
-        Diffusion_device = 'cuda:0'
-        LLaVA_device = 'cuda:0'
     else:
         raise ValueError('Currently support CUDA only.')
-
-    use_llava = not args.no_llava
-    if use_llava:
-        print("Loading LLaVA agent...")
-        llava_agent = LLavaAgent(LLAVA_MODEL_PATH, device=LLaVA_device, load_8bit=True, load_4bit=False)
-    else:
-        llava_agent = None
         
     # 載入 FaithDiff 模型
     print("Loading FaithDiff pipeline...")
@@ -145,13 +121,8 @@ def main():
         try:
             image = Image.open(img_path).convert("RGB")
             
-            if args.prompt:
-                current_prompt = args.prompt
-            elif use_llava:
-                caption = llava_agent.gen_image_caption([image])
-                current_prompt = caption[0]
-            else:
-                current_prompt = ""
+            # 直接使用 args.prompt，若無則預設為空字串
+            current_prompt = args.prompt
                 
             # image process
             result_np = process(
