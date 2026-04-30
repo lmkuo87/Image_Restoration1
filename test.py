@@ -1,140 +1,176 @@
-import torch.cuda
-import argparse
-from FaithDiff.create_FaithDiff_model import FaithDiff_pipeline
-from PIL import Image
-from CKPT_PTH import LLAVA_MODEL_PATH, SDXL_PATH, FAITHDIFF_PATH, VAE_FP16_PATH, BSRNet_PATH
-from utils.color_fix import wavelet_color_fix, adain_color_fix
-from utils.image_process import check_image_size
-from llava.llm_agent import LLavaAgent
-
 import os
+import torch
+import torch.utils.checkpoint
+import torch.cuda
+import random
 import numpy as np
-import cv2
+import argparse
+from typing import List
+from PIL import Image
 
-from FaithDiff.create_FaithDiff_model import create_bsrnet
-from utils.image_process import image2tensor, tensor2image
+from FaithDiff.create_FaithDiff_model import FaithDiff_pipeline
+from CKPT_PTH import LLAVA_MODEL_PATH, SDXL_PATH, FAITHDIFF_PATH, VAE_FP16_PATH
+from utils.color_fix import wavelet_color_fix, adain_color_fix
+from utils.image_process import check_image_size, create_hdr_effect
+from llava.llm_agent import LLavaAgent
+from utils.system import torch_gc
 
+MAX_SEED = np.iinfo(np.int32).max
 
-if torch.cuda.device_count() >= 2:
-    LLaVA_device = 'cuda:1'
-    Diffusion_device = 'cuda:0'
-elif torch.cuda.device_count() == 1:
-    Diffusion_device = 'cuda:0'
-    LLaVA_device = 'cuda:0'
-else:
-    raise ValueError('Currently support CUDA only.')
+def parse_args():
+    parser = argparse.ArgumentParser(description="FaithDiff Local Batch Processing")
+    
+    parser.add_argument("--input_dir", type=str, required=True, help="Path to the input images directory")
+    parser.add_argument("--output_dir", type=str, required=True, help="Path to the output images directory")
+    parser.add_argument("--prompt", type=str, default="", help="Global prompt for all images (Optional)")
 
+    parser.add_argument("--no_llava", action='store_true', default=False, help="Disable LLaVA for auto-captioning")
+    parser.add_argument("--cpu_offload", action='store_true', default=False)
+    parser.add_argument("--use_fp8", action='store_true', default=False)
+    
+    parser.add_argument("--num_inference_steps", type=int, default=20)
+    parser.add_argument("--scale_factor", type=float, default=2.0)
+    parser.add_argument("--guidance_scale", type=float, default=5.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--latent_tiled_size", type=int, default=1024)
+    parser.add_argument("--latent_tiled_overlap", type=float, default=0.5)
+    parser.add_argument("--color_fix", type=str, choices=["wavelet", "adain", "nofix"], default="adain")
+    parser.add_argument("--start_point", type=str, choices=["lr", "noise"], default="lr")
+    parser.add_argument("--hdr", type=float, default=0.0)
+    
+    return parser.parse_args()
 
-# hyparams here
-parser = argparse.ArgumentParser()
-parser.add_argument("--img_dir", type=str)
-parser.add_argument("--save_dir", type=str)
-parser.add_argument("--upscale", type=int, default=4)
-parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--min_size", type=int, default=1024)
-parser.add_argument("--latent_tiled_overlap", type=float, default=0.5)
-parser.add_argument("--latent_tiled_size", type=int, default=1024)
-parser.add_argument("--guidance_scale", type=float, default=5)
-parser.add_argument("--num_inference_steps", type=int, default=20)
-parser.add_argument("--no_llava", action='store_true', default=False)
-parser.add_argument("--use_tile_vae", action='store_true', default=False)
-parser.add_argument("--vae_tiled_overlap", type=float, default=0.25)
-parser.add_argument("--vae_tiled_size", type=int, default=1024)
-parser.add_argument("--use_bsrnet", action='store_true', default=False)
-parser.add_argument("--load_8bit_llava", action='store_true', default=False)
-parser.add_argument("--color_fix", type=str, choices=['wavelet', 'adain', 'nofix'], default='adain')
-parser.add_argument("--start_point", type=str, choices=['lr', 'noise'], default='lr')
-parser.add_argument("--cpu_offload", action='store_true', default=False)
-parser.add_argument("--use_fp8", action='store_true', default=False)
-args = parser.parse_args()
-print(args)
-cpu_offload = args.cpu_offload
-use_fp8 = args.use_fp8
-use_llava = not args.no_llava
-use_bsrnet = args.use_bsrnet
+@torch.no_grad()
+def process(
+    pipe,
+    image: Image.Image,
+    user_prompt: str,
+    args,
+    Diffusion_device
+) -> np.ndarray:
 
-# load FaithDiff FP16
-pipe = FaithDiff_pipeline(sdxl_path=SDXL_PATH, VAE_FP16_path=VAE_FP16_PATH, FaithDiff_path=FAITHDIFF_PATH, use_fp8=use_fp8)
-pipe = pipe.to(Diffusion_device)
-
-if use_bsrnet:
-    bsrnet = create_bsrnet(BSRNet_PATH)
-    bsrnet.to(LLaVA_device)
-    bsrnet.eval()
-else:
-    bsrnet = None
-
-if args.use_tile_vae:
-    ### enable_vae_tiling
-    pipe.set_encoder_tile_settings()
-    pipe.enable_vae_tiling()
-
-if cpu_offload:
-    pipe.enable_model_cpu_offload()
-
-# load LLaVA
-if use_llava:
-    llava_agent = LLavaAgent(LLAVA_MODEL_PATH, device=LLaVA_device, load_8bit=args.load_8bit_llava, load_4bit=False)
-else:
-    llava_agent = None
-
-
-os.makedirs(args.save_dir, exist_ok=True)
-
-exist_file = os.listdir(args.save_dir)
-with torch.no_grad():
-    for file_name in sorted(os.listdir(args.img_dir)):
-        img_name, ext = os.path.splitext(file_name)
-        if ext == ".json":
-            continue
-        
-        if f"{img_name}.png" in exist_file:
-            print(f"{img_name}.png exist")
-            continue
-        else:
-            print(img_name)
-        image = Image.open(os.path.join(args.img_dir,file_name)).convert('RGB')
-
-        if use_bsrnet:
-            image_tensor = image2tensor(np.array(image))
-            image_tensor = image_tensor.to(LLaVA_device)
-            image_tensor = bsrnet.deg_remove(image_tensor)
-            image_deg_remove = Image.fromarray(tensor2image(image_tensor))
-        else:
-            image_deg_remove = image
-
-        # step 1: LLaVA
-        if use_llava:
-            captions = llava_agent.gen_image_caption([image_deg_remove])
-        else:
-            captions = ['']
-
-        init_text = captions[0]
+    w, h = image.size
+    w = int(w * args.scale_factor)
+    h = int(h * args.scale_factor)
+    image = image.resize((w, h), Image.LANCZOS)
+    input_image, width_init, height_init, width_now, height_now = check_image_size(image)
+    
+    if not args.no_llava and not args.prompt:
+        init_text = user_prompt
         words = init_text.split()
-        words = words[3:]
-        words[0] = words[0].capitalize()
+        if len(words) > 3:
+            words = words[3:]
+            words[0] = words[0].capitalize()
         text = ' '.join(words)
         text = text.split('. ')
         text = '. '.join(text[:2]) + '.'
-        print(text)
+        user_prompt = text 
 
-        # step 2: Restoration
-        w, h = image.size
-        w *= args.upscale
-        h *= args.upscale
-        image = image.resize((w, h), Image.LANCZOS)
-        input_image, width_init, height_init, width_now, height_now = check_image_size(image)
-        prompt_init = text 
-        negative_prompt_init = ""
-        generator = torch.Generator(device='cuda').manual_seed(args.seed)
-        gen_image = pipe(lr_img=input_image, prompt = prompt_init, negative_prompt = negative_prompt_init, num_inference_steps=args.num_inference_steps, guidance_scale=args.guidance_scale, generator=generator, start_point=args.start_point, height = height_now, width=width_now,  overlap=args.latent_tiled_overlap, target_size=(args.latent_tiled_size, args.latent_tiled_size)).images[0]
-        path = os.path.join(args.save_dir, img_name+'.png')
-        cropped_image = gen_image.crop((0, 0, width_init, height_init))
-        if args.color_fix == 'nofix':
-            out_image = cropped_image
-        else:
-            if args.color_fix == 'wavelet':
-                out_image = wavelet_color_fix(cropped_image, image)
-            elif args.color_fix == 'adain':
-                out_image = adain_color_fix(cropped_image, image)
-        out_image.save(path)
+    negative_prompt_init = ""
+    generator = torch.Generator(device=Diffusion_device).manual_seed(args.seed)    
+    input_image = create_hdr_effect(input_image, args.hdr)
+
+    gen_image = pipe(
+        lr_img=input_image, 
+        prompt=user_prompt, 
+        negative_prompt=negative_prompt_init, 
+        num_inference_steps=args.num_inference_steps, 
+        guidance_scale=args.guidance_scale, 
+        generator=generator, 
+        start_point=args.start_point, 
+        height=height_now, 
+        width=width_now,  
+        overlap=args.latent_tiled_overlap, 
+        target_size=(args.latent_tiled_size, args.latent_tiled_size)
+    ).images[0]
+    
+    torch_gc()
+    cropped_image = gen_image.crop((0, 0, width_init, height_init))
+    
+    if args.color_fix == 'nofix':
+        out_image = cropped_image
+    elif args.color_fix == 'wavelet':
+        out_image = wavelet_color_fix(cropped_image, image)
+    elif args.color_fix == 'adain':
+        out_image = adain_color_fix(cropped_image, image)
+
+    return np.array(out_image)
+
+def main():
+    args = parse_args()
+    
+    if torch.cuda.device_count() >= 2:
+        LLaVA_device = 'cuda:1'
+        Diffusion_device = 'cuda:0'
+    elif torch.cuda.device_count() == 1:
+        Diffusion_device = 'cuda:0'
+        LLaVA_device = 'cuda:0'
+    else:
+        raise ValueError('Currently support CUDA only.')
+
+    use_llava = not args.no_llava
+    if use_llava:
+        print("Loading LLaVA agent...")
+        llava_agent = LLavaAgent(LLAVA_MODEL_PATH, device=LLaVA_device, load_8bit=True, load_4bit=False)
+    else:
+        llava_agent = None
+        
+    # 載入 FaithDiff 模型
+    print("Loading FaithDiff pipeline...")
+    pipe = FaithDiff_pipeline(sdxl_path=SDXL_PATH, VAE_FP16_path=VAE_FP16_PATH, FaithDiff_path=FAITHDIFF_PATH, use_fp8=args.use_fp8)
+    pipe = pipe.to(Diffusion_device)
+
+    pipe.set_encoder_tile_settings()
+    pipe.enable_vae_tiling()
+
+    if args.cpu_offload:
+        pipe.enable_model_cpu_offload()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    valid_extensions = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
+    image_files = [f for f in os.listdir(args.input_dir) if f.lower().endswith(valid_extensions)]
+    
+    if not image_files:
+        print(f"No valid images found in {args.input_dir}")
+        return
+
+    print(f"Found {len(image_files)} images. Starting processing...")
+
+    for img_name in image_files:
+        img_path = os.path.join(args.input_dir, img_name)
+        out_path = os.path.join(args.output_dir, img_name)
+        
+        print(f"Processing: {img_name}...")
+        try:
+            image = Image.open(img_path).convert("RGB")
+            
+            if args.prompt:
+                current_prompt = args.prompt
+            elif use_llava:
+                caption = llava_agent.gen_image_caption([image])
+                current_prompt = caption[0]
+            else:
+                current_prompt = ""
+                
+            # image process
+            result_np = process(
+                pipe=pipe,
+                image=image,
+                user_prompt=current_prompt,
+                args=args,
+                Diffusion_device=Diffusion_device
+            )
+            
+            # save image
+            result_img = Image.fromarray(result_np)
+            result_img.save(out_path)
+            print(f"Saved result to: {out_path}")
+            
+        except Exception as e:
+            print(f"Error processing {img_name}: {e}")
+
+    print("All images processed successfully!")
+
+if __name__ == "__main__":
+    main()
