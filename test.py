@@ -91,7 +91,6 @@ def main():
     else:
         raise ValueError('Currently support CUDA only.')
         
-    # 載入 FaithDiff 模型
     print("Loading FaithDiff pipeline...")
     pipe = FaithDiff_pipeline(sdxl_path=SDXL_PATH, VAE_FP16_path=VAE_FP16_PATH, FaithDiff_path=FAITHDIFF_PATH, use_fp8=args.use_fp8)
     pipe = pipe.to(Diffusion_device)
@@ -120,8 +119,7 @@ def main():
         print(f"Processing: {img_name}...")
         try:
             image = Image.open(img_path).convert("RGB")
-            
-            # 直接使用 args.prompt，若無則預設為空字串
+    
             current_prompt = args.prompt
                 
             # image process
