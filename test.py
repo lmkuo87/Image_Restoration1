@@ -21,7 +21,6 @@ def parse_args():
     
     parser.add_argument("--input_dir", type=str, required=True, help="Path to the input images directory")
     parser.add_argument("--output_dir", type=str, required=True, help="Path to the output images directory")
-    parser.add_argument("--prompt", type=str, default="", help="Global prompt for all images (Optional)")
 
     parser.add_argument("--cpu_offload", action='store_true', default=False)
     parser.add_argument("--use_fp8", action='store_true', default=False)
@@ -42,7 +41,6 @@ def parse_args():
 def process(
     pipe,
     image: Image.Image,
-    user_prompt: str,
     args,
     Diffusion_device
 ) -> np.ndarray:
@@ -57,9 +55,10 @@ def process(
     generator = torch.Generator(device=Diffusion_device).manual_seed(args.seed)    
     input_image = create_hdr_effect(input_image, args.hdr)
 
+    # 這裡直接將 prompt 設為空字串
     gen_image = pipe(
         lr_img=input_image, 
-        prompt=user_prompt, 
+        prompt="", 
         negative_prompt=negative_prompt_init, 
         num_inference_steps=args.num_inference_steps, 
         guidance_scale=args.guidance_scale, 
@@ -119,14 +118,11 @@ def main():
         print(f"Processing: {img_name}...")
         try:
             image = Image.open(img_path).convert("RGB")
-    
-            current_prompt = args.prompt
                 
             # image process
             result_np = process(
                 pipe=pipe,
                 image=image,
-                user_prompt=current_prompt,
                 args=args,
                 Diffusion_device=Diffusion_device
             )
