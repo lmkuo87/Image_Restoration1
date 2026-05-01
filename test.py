@@ -17,8 +17,6 @@ from utils.system import torch_gc
 MAX_SEED = np.iinfo(np.int32).max
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="FaithDiff Local Batch Processing (No LLaVA)")
-    
     parser.add_argument("--input_dir", type=str, required=True, help="Path to the input images directory")
     parser.add_argument("--output_dir", type=str, required=True, help="Path to the output images directory")
 
